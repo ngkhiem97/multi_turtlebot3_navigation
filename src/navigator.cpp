@@ -1,75 +1,20 @@
-#include "ros/ros.h"
-#include "geometry_msgs/PoseStamped.h"
-#include "nav_msgs/GetPlan.h"
-#include "nav_msgs/Path.h"
-#include <tf/transform_listener.h>
-#include <math.h>
+#include <ros/ros.h>
+#include <ros/console.h>
+#include <geometry_msgs/PoseStamped.h>
 #include <move_base_msgs/MoveBaseAction.h>
 #include <actionlib/client/simple_action_client.h>
+#include <multi_turtlebot3_navigation/navigator.h>
+#include <multi_turtlebot3_navigation/task_distributor.h>
+#include <map>
+#include <thread>
 
-tf::StampedTransform getTransform(const std::string& target_frame, const std::string& source_frame)
+// Store the received goals from /move_base_simple/goal topic
+std::vector<geometry_msgs::PoseStamped> goals;
+std::vector<std::string> robots;
+
+void sendGoal(const std::string actionlib, const geometry_msgs::PoseStamped poseStamped)
 {
-  ros::NodeHandle n;
-
-  tf::TransformListener listener;
-  tf::StampedTransform transform;
-
-  while (n.ok()){
-    try{
-      listener.lookupTransform(target_frame, source_frame, ros::Time(0), transform);
-    }
-    catch (tf::TransformException ex){
-      ROS_WARN("%s",ex.what());
-      ros::Duration(1.0).sleep();
-      continue;
-    }
-    return transform;
-  }
-}
-
-geometry_msgs::PoseStamped tfToPoseStamped(const tf::StampedTransform& transform)
-{
-  geometry_msgs::PoseStamped poseStamped;
-
-  // Assign header
-  poseStamped.header.frame_id = "map";
-  poseStamped.header.stamp = ros::Time::now();
-
-  // Assign position
-  poseStamped.pose.position.x = transform.getOrigin().x();
-  poseStamped.pose.position.y = transform.getOrigin().y();
-  poseStamped.pose.position.z = transform.getOrigin().z();
-  
-  // Assign orientation
-  poseStamped.pose.orientation.x = transform.getOrigin().x();
-  poseStamped.pose.orientation.y = transform.getOrigin().y();
-  poseStamped.pose.orientation.z = transform.getOrigin().z();
-  poseStamped.pose.orientation.w = transform.getOrigin().w();
-
-  return poseStamped;
-}
-
-double getDistance(const nav_msgs::Path& path)
-{
-  double path_length = 0;
-  double position_a_x, position_b_x, position_a_y, position_b_y;
-  if (path.poses.size() >= 2) {
-    for (int i = 0; i < path.poses.size() - 1; i++) {
-      position_a_x = path.poses[i].pose.position.x;
-      position_b_x = path.poses[i+1].pose.position.x;
-      position_a_y = path.poses[i].pose.position.y;
-      position_b_y = path.poses[i+1].pose.position.y;
-
-      path_length += sqrt(pow((position_b_x - position_a_x), 2) + pow((position_b_y - position_a_y), 2));
-    }
-  }
-  ROS_INFO("Distance returned!");
-  printf(std::to_string(path_length).c_str());
-  return path_length;
-}
-
-void sendGoal(const std::string& actionlib, const geometry_msgs::PoseStamped::ConstPtr& poseStamped)
-{
+  ROS_WARN("Begin sending goal!");
   //tell the action client that we want to spin a thread by default
   actionlib::SimpleActionClient<move_base_msgs::MoveBaseAction> ac(actionlib, true);
 
@@ -82,16 +27,15 @@ void sendGoal(const std::string& actionlib, const geometry_msgs::PoseStamped::Co
   move_base_goal.target_pose.header.frame_id = "map";
   move_base_goal.target_pose.header.stamp    = ros::Time::now();
 
-  move_base_goal.target_pose.pose.position.x = poseStamped->pose.position.x;
-  move_base_goal.target_pose.pose.position.y = poseStamped->pose.position.y;
-  move_base_goal.target_pose.pose.position.z = poseStamped->pose.position.z;
-  move_base_goal.target_pose.pose.orientation.x = poseStamped->pose.orientation.x;
-  move_base_goal.target_pose.pose.orientation.y = poseStamped->pose.orientation.y;
-  move_base_goal.target_pose.pose.orientation.z = poseStamped->pose.orientation.z;
-  move_base_goal.target_pose.pose.orientation.w = poseStamped->pose.orientation.w;
+  move_base_goal.target_pose.pose.position.x = poseStamped.pose.position.x;
+  move_base_goal.target_pose.pose.position.y = poseStamped.pose.position.y;
+  move_base_goal.target_pose.pose.position.z = poseStamped.pose.position.z;
+  move_base_goal.target_pose.pose.orientation.x = poseStamped.pose.orientation.x;
+  move_base_goal.target_pose.pose.orientation.y = poseStamped.pose.orientation.y;
+  move_base_goal.target_pose.pose.orientation.z = poseStamped.pose.orientation.z;
+  move_base_goal.target_pose.pose.orientation.w = poseStamped.pose.orientation.w;
 
-  ROS_INFO("Send navigation goal to:");
-  ROS_INFO(actionlib.c_str());
+  ROS_INFO("Sending goal");
   ac.sendGoal(move_base_goal);
 
   ac.waitForResult();
@@ -100,55 +44,43 @@ void sendGoal(const std::string& actionlib, const geometry_msgs::PoseStamped::Co
     ROS_INFO("Hooray, naviagtion goal send");
   else
     ROS_INFO("Robot failed to move");
-
 }
 
-/**
- * This tutorial demonstrates simple receipt of messages over the ROS system.
- */
+// Navigate multiple robots
+void executeSeq()
+{
+  multi_turtlebot3_navigation::NavigationAlgorithmSimple simpleAlgorithm;
+  multi_turtlebot3_navigation::TaskDistributor distributor(&simpleAlgorithm);
+
+  ROS_INFO("Getting the plan!");
+  std::multimap<std::string, geometry_msgs::PoseStamped> plan = distributor.run(robots, goals);
+  ROS_INFO("Plan size: %d", (int) plan.size());
+
+  std::vector<std::thread> threads;
+  for (std::multimap<std::string, geometry_msgs::PoseStamped>::iterator it = plan.begin(); it != plan.end(); it++)
+  {
+    ROS_WARN("For plan: %s",it->first.c_str());
+    std::thread thread(sendGoal, it->first + "/move_base", it->second);
+    threads.push_back(std::move(thread));
+  }
+
+  for (std::vector<std::thread>::iterator it = threads.begin(); it != threads.end(); ++it)
+  {
+    if (it->joinable()) it->join();
+  }
+}
+
 void setGoalCallback(const geometry_msgs::PoseStamped::ConstPtr& poseStamped)
 {
-  ROS_INFO("I heard a goal!!!");
-  ROS_INFO("header.frame_id: [%s]", poseStamped->header.frame_id.c_str());
-  ROS_INFO("pose.position.x: [%f]", poseStamped->pose.position.x);
-  ROS_INFO("pose.position.y: [%f]", poseStamped->pose.position.y);
-  ROS_INFO("pose.position.z: [%f]", poseStamped->pose.position.z);
+  goals.push_back(*poseStamped);
 
-  ros::NodeHandle n;
+  if (goals.size() == robots.size())
+  {
+    executeSeq();
 
-  /**
-   * Loop three Turtlebots
-   */ 
-
-  // Get navigation plan of turtlebot01
-  tf::StampedTransform transform_1 = getTransform("/map", "/turtle_1/base_footprint");
-  nav_msgs::GetPlan getPlan01;
-  getPlan01.request.start     = tfToPoseStamped(transform_1);
-  getPlan01.request.goal      = *poseStamped;
-  getPlan01.request.tolerance = .5;
-  n.serviceClient<nav_msgs::GetPlan>("/turtle_1/move_base/NavfnROS/make_plan").call(getPlan01);
-
-  ROS_INFO("Getting distance for turtle_1!!!");
-  double d1 = getDistance(getPlan01.response.plan);
-
-  // Get navigation plan of turtlebot02
-  tf::StampedTransform transform_2 = getTransform("/map", "/turtle_2/base_footprint");
-  nav_msgs::GetPlan getPlan02;
-  getPlan02.request.start     = tfToPoseStamped(transform_2);
-  getPlan02.request.goal      = *poseStamped;
-  getPlan02.request.tolerance = .5;
-  n.serviceClient<nav_msgs::GetPlan>("/turtle_2/move_base/NavfnROS/make_plan").call(getPlan02);
-
-  ROS_INFO("Getting distance for turtle_2!!!");
-  double d2 = getDistance(getPlan02.response.plan);
-
-  /**
-   * Send goal to shortest distance
-   */ 
-  if (d1 <= d2) {
-    sendGoal("/turtle_1/move_base", poseStamped);
-  } else {
-    sendGoal("/turtle_2/move_base", poseStamped);
+    ROS_WARN("Clearing the buffer!");
+    // Clear the goals buffer
+    goals.clear(); 
   }
 }
 
@@ -172,6 +104,10 @@ int main(int argc, char **argv)
    * NodeHandle destructed will close down the node.
    */
   ros::NodeHandle n;
+
+  robots.push_back("turtlebot01");
+  robots.push_back("turtlebot02");
+  robots.push_back("turtlebot03");
 
   /**
    * The subscribe() call is how you tell ROS that you want to receive messages
