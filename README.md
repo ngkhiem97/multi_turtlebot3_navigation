@@ -1,6 +1,6 @@
 # multi_turtlebot3_navigation
 
-Repository for controlling 2 Turtlebt3 robots in Vietnamese-German University's Robotics Lab
+Repository for controlling 2 Turtlebot3 robots in Vietnamese-German University's Robotics Lab
 
 ## Setup on Master Computer
 
